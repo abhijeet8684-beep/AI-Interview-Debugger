@@ -14,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from pipeline.diagnosis_pipeline import DiagnosisPipeline, DiagnosisResult
 from pipeline.schema import InterviewSession
+from app.ml_analytics import render_ml_analytics
 
 
 def _pipeline() -> DiagnosisPipeline:
@@ -242,39 +243,43 @@ def main() -> None:
     st.title("AI Interview Debugger")
     st.caption("Deterministic debugging for AI interview sessions")
     _render_project_sidebar()
-    st.markdown("---")
-    st.markdown("#### Upload an Interview Session")
-    st.write(
-        "Select a single JSON document matching the frozen `InterviewSession` "
-        "schema. No analysis runs until a valid session is uploaded."
-    )
-    uploaded_file = st.file_uploader("InterviewSession JSON", type=["json"])
-    if uploaded_file is None:
-        _render_landing_content()
-        _render_footer()
-        return
 
-    try:
-        session = _load_session(uploaded_file)
-    except ValueError as error:
-        st.error(str(error))
-        return
+    diagnosis_tab, analytics_tab = st.tabs(["Diagnosis", "📊 ML Analytics"])
 
-    _render_sidebar(session)
-    try:
-        result = _pipeline().run(session)
-    except Exception as error:
-        st.error("The diagnosis pipeline could not complete for this session.")
-        st.exception(error)
-        return
+    with diagnosis_tab:
+        st.markdown("---")
+        st.markdown("#### Upload an Interview Session")
+        st.write(
+            "Select a single JSON document matching the frozen `InterviewSession` "
+            "schema. No analysis runs until a valid session is uploaded."
+        )
+        uploaded_file = st.file_uploader("InterviewSession JSON", type=["json"])
+        if uploaded_file is None:
+            _render_landing_content()
+        else:
+            try:
+                session = _load_session(uploaded_file)
+            except ValueError as error:
+                st.error(str(error))
+            else:
+                _render_sidebar(session)
+                try:
+                    result = _pipeline().run(session)
+                except Exception as error:
+                    st.error("The diagnosis pipeline could not complete for this session.")
+                    st.exception(error)
+                else:
+                    _render_overview(result)
+                    _render_rules(result)
+                    _render_evidence(result)
+                    _render_similar_sessions(result)
+                    _render_diagnosis(result)
+                    _render_timeline(session)
+                    _render_pipeline_summary(result)
 
-    _render_overview(result)
-    _render_rules(result)
-    _render_evidence(result)
-    _render_similar_sessions(result)
-    _render_diagnosis(result)
-    _render_timeline(session)
-    _render_pipeline_summary(result)
+    with analytics_tab:
+        render_ml_analytics()
+
     _render_footer()
 
 

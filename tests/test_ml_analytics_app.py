@@ -1,0 +1,85 @@
+"""Tests for the ML analytics dashboard helpers."""
+from __future__ import annotations
+
+import numpy as np
+
+from app.ml_analytics import (
+    build_evaluation_dataframe,
+    feature_importance_dataframe,
+    get_confusion_matrix,
+    load_dataset_statistics,
+    load_json_report,
+)
+
+
+def test_load_json_report_invalid_returns_none() -> None:
+    assert load_json_report(b"not a json") is None
+
+
+def test_build_evaluation_dataframe_returns_sorted_metrics() -> None:
+    report = {
+        "evaluations": [
+            {
+                "model_name": "Random Forest",
+                "metrics": {
+                    "accuracy": 0.8,
+                    "precision": 0.75,
+                    "recall": 0.76,
+                    "macro_f1": 0.77,
+                    "weighted_f1": 0.78,
+                    "micro_f1": 0.79,
+                },
+            },
+            {
+                "model_name": "Logistic Regression",
+                "metrics": {
+                    "accuracy": 0.82,
+                    "precision": 0.78,
+                    "recall": 0.79,
+                    "macro_f1": 0.80,
+                    "weighted_f1": 0.81,
+                    "micro_f1": 0.82,
+                },
+            },
+        ]
+    }
+    df = build_evaluation_dataframe([report])
+    assert list(df["Model"]) == ["Logistic Regression", "Random Forest"]
+    assert df.iloc[0]["Macro F1"] == 0.8
+
+
+def test_get_confusion_matrix_for_model() -> None:
+    report = {
+        "evaluations": [
+            {
+                "model_name": "Gradient Boosting",
+                "confusion_matrix": [[10, 2], [1, 7]],
+                "class_labels": ["success", "failure"],
+            }
+        ]
+    }
+    matrix, labels = get_confusion_matrix(report, "Gradient Boosting")
+    assert matrix.shape == (2, 2)
+    assert labels == ["success", "failure"]
+    assert (matrix == [[10, 2], [1, 7]]).all()
+
+
+def test_feature_importance_dataframe_returns_top_features() -> None:
+    report = {
+        "model_name": "Logistic Regression",
+        "ranking": [
+            {"feature_name": "f1", "importance_score": 0.6, "normalized_score": 0.5, "rank": 1},
+            {"feature_name": "f2", "importance_score": 0.4, "normalized_score": 0.3, "rank": 2},
+        ],
+    }
+    df = feature_importance_dataframe(report, top_n=2)
+    assert df.iloc[0]["Feature"] == "f1"
+    assert df.iloc[1]["Feature"] == "f2"
+
+
+def test_load_dataset_statistics_default_sample() -> None:
+    stats, dataset = load_dataset_statistics()
+    assert stats.row_count > 0
+    assert stats.feature_count > 0
+    assert len(dataset.session_ids) == stats.row_count
+    assert len(dataset.feature_names) == stats.feature_count
