@@ -362,13 +362,13 @@ python -m pytest -q
 
 **Abhijeet**
 
-Master of Engineering (Embedded Systems)
-
+Master of Engineering (Embedded Systems)  
 BITS Pilani, K. K. Birla Goa Campus
 
-GitHub: [@abhijeet8684-beep](https://github.com/abhijeet8684-beep)
+Passionate about Embedded Systems, Embedded Linux, and AI-driven Software Engineering.
 
-LinkedIn: [Profile placeholder](https://www.linkedin.com/in/your-linkedin-profile/)
+- GitHub: [@abhijeet8684-beep](https://github.com/abhijeet8684-beep)
+- LinkedIn: [Abhijeet](https://www.linkedin.com/in/abhijeet-80926537b/)
 
 ## Acknowledgements
 
