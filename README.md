@@ -5,12 +5,28 @@
 [![Python](https://img.shields.io/badge/Python-3.12-blue.svg)](https://www.python.org/)
 [![Streamlit](https://img.shields.io/badge/Streamlit-dashboard-ff4b4b.svg)](https://streamlit.io/)
 [![scikit-learn](https://img.shields.io/badge/scikit--learn-ML%20analytics-f7931e.svg)](https://scikit-learn.org/)
+[![pandas](https://img.shields.io/badge/pandas-data%20analysis-150458.svg)](https://pandas.pydata.org/)
+[![NumPy](https://img.shields.io/badge/NumPy-numerical%20computing-4d77cf.svg)](https://numpy.org/)
 [![Pytest](https://img.shields.io/badge/tests-100%20passing-success.svg)](https://docs.pytest.org/)
 [![Version](https://img.shields.io/badge/version-v1.0-informational.svg)](#)
+
+## Live Dashboard Demo
+
+<p align="center">
+  <img src="assets/dashboard_demo.gif" alt="AI Interview Debugger dashboard demonstration" width="100%">
+</p>
+
+This demonstration follows the complete application workflow: launching the dashboard, uploading an interview session, and running deterministic diagnosis. It then switches to ML Analytics to show model evaluation, feature importance, the confusion matrix, drift detection, and anomaly detection. The final steps show the generated reports available for download, connecting the interactive analysis to reusable JSON outputs.
 
 AI interview platforms depend on several moving parts: transcripts, LLM calls, retrieval and evaluation tools, timelines, and downstream scoring. When an interview fails, raw logs alone make it difficult to determine what happened and why. AI Interview Debugger turns one typed interview session into measurable signals, deterministic rule results, traceable evidence, historical similarity matches, a confidence score, and a structured engineering diagnosis.
 
 The project keeps runtime diagnosis deterministic and inspectable. Its separate offline ML analytics layer complements that reasoning with model evaluation, explainability, distribution drift, and anomaly discovery over historical synthetic sessions. The two layers are intentionally decoupled: analytics do not alter a live diagnosis.
+
+## Why This Project?
+
+Modern AI interview systems combine independent components: LLM inference, retrieval, speech-to-text, evaluation engines, tool integrations, and external APIs. A failure can propagate across these boundaries, while individual logs often expose symptoms without clearly identifying the responsible component or the measurable evidence behind a conclusion.
+
+AI Interview Debugger combines deterministic rules and traceable evidence with explainable offline machine learning. This produces structured, evidence-based analysis that users can inspect and export, rather than relying on an opaque black-box diagnosis.
 
 ## Quick Start
 
@@ -138,6 +154,16 @@ The **ML Analytics** tab accepts the generated CSV or JSONL dataset. Each row in
 ## Failure scenarios in the synthetic data
 
 The default generator creates successful interviews and injects realistic failures such as speech-to-text degradation, LLM timeout, tool timeout, invalid JSON, context-window overflow, retrieval failure, evaluation failure, network/API failure, and database failure. Some sessions include retry or propagation effects across components. The predicted `diagnosis` field is intentionally left empty in generated data; only `ground_truth` is populated.
+
+## Input Files
+
+| File | Used In | Description |
+| --- | --- | --- |
+| `InterviewSession.json` | Diagnosis | One complete interview session used for deterministic diagnosis. The files in `examples/` are ready-to-upload instances. |
+| `interview_sessions.csv` | ML Analytics | Flattened dataset in which each row corresponds to one generated interview session; used for supported model evaluation, feature importance, drift detection, and anomaly detection inputs. |
+| `interview_sessions.jsonl` | Backend / Data Exchange | Newline-delimited JSON containing the same generated session population with complete nested `InterviewSession` records for structured processing and interoperability. |
+
+CSV and JSONL are generated together from the same session population. CSV is the flattened analytical view, while JSONL retains the full structured records; both support different serialization and integration workflows.
 
 ---
 
@@ -365,10 +391,11 @@ python -m pytest -q
 Master of Engineering (Embedded Systems)  
 BITS Pilani, K. K. Birla Goa Campus
 
-Passionate about Embedded Systems, Embedded Linux, and AI-driven Software Engineering.
+Passionate about Embedded Systems, Embedded Linux, Explainable AI, and Machine Learning.
 
-- GitHub: [@abhijeet8684-beep](https://github.com/abhijeet8684-beep)
-- LinkedIn: [Abhijeet](https://www.linkedin.com/in/abhijeet-80926537b/)
+GitHub: [https://github.com/abhijeet8684-beep](https://github.com/abhijeet8684-beep)
+
+LinkedIn: [https://www.linkedin.com/in/abhijeet-80926537b/](https://www.linkedin.com/in/abhijeet-80926537b/)
 
 ## Acknowledgements
 
@@ -376,4 +403,4 @@ This project was developed as part of the Master of Engineering (Embedded System
 
 ## License
 
-No license file is currently included in this repository. Add an explicit license before distributing or accepting external contributions.
+No license file is currently included in this repository. Licensing information can be added in future releases.
