@@ -40,6 +40,22 @@ AnomalyReport = Dict[str, Any]
 ProgressCallback = Callable[[int, str], None]
 
 
+def _card_container(st: Any) -> Any:
+    """Return a bordered container when supported by the installed Streamlit."""
+    try:
+        return st.container(border=True)
+    except TypeError:
+        return st.container()
+
+
+def _render_figure(st: Any, figure: plt.Figure) -> None:
+    """Render a chart at available width with compatibility fallback."""
+    try:
+        st.pyplot(figure, use_container_width=True)
+    except TypeError:
+        st.pyplot(figure)
+
+
 def load_json_report(data: bytes) -> Optional[Dict[str, Any]]:
     """Parse a JSON report from raw uploaded bytes.
 
@@ -158,25 +174,147 @@ def get_confusion_matrix(report: EvaluationReport, model_name: str) -> Tuple[np.
     return np.empty((0, 0), dtype=int), []
 
 
+def format_confusion_matrix_label(label: str) -> str:
+    """Return a compact, display-only label for dense confusion matrices."""
+    normalized = label.lower().strip().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "context_window": "ctx\nwindow",
+        "context_window_overflow": "ctx\nwindow",
+        "db_failure": "db\nfailure",
+        "database_failure": "db\nfailure",
+        "eval_failure": "eval\nfailure",
+        "evaluation_failure": "eval\nfailure",
+        "json_invalid": "json\ninvalid",
+        "invalid_json_response": "json\ninvalid",
+        "json_validation_error": "json\ninvalid",
+        "llm_timeout": "llm\ntimeout",
+        "network_api": "network\napi",
+        "network_api_failure": "network\napi",
+        "retrieval": "retrieval",
+        "retrieval_failure": "retrieval",
+        "speech_to_text": "speech\nto_text",
+        "speech_to_text_failure": "speech\nto_text",
+        "successful_interview": "success",
+        "tool_timeout": "tool\ntimeout",
+    }
+    if normalized in aliases:
+        return aliases[normalized]
+    return normalized.replace("_", "\n") if len(normalized) > 12 else normalized
+
+
+def summarize_confusion_matrix(matrix: np.ndarray, labels: List[str]) -> str:
+    """Summarize the largest observed off-diagonal confusion deterministically."""
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1] or not labels:
+        return "No valid confusion matrix is available for interpretation."
+    largest_count = 0
+    largest_pair: Optional[Tuple[int, int]] = None
+    for actual_index in range(matrix.shape[0]):
+        for predicted_index in range(matrix.shape[1]):
+            value = int(matrix[actual_index, predicted_index])
+            if actual_index != predicted_index and value > largest_count:
+                largest_count = value
+                largest_pair = (actual_index, predicted_index)
+    if largest_pair is None:
+        return "No class confusions were observed in this evaluation holdout."
+    actual_index, predicted_index = largest_pair
+    return (
+        f"The classifier most frequently confuses {labels[actual_index]} with "
+        f"{labels[predicted_index]} ({largest_count} sessions), indicating "
+        "overlapping telemetry features in the evaluated holdout."
+    )
+
+
+def build_confusion_matrix_observations(matrix: np.ndarray, labels: List[str]) -> List[str]:
+    """Return concise, data-derived observations for a confusion matrix.
+
+    The observations are presentation-only summaries of the selected model's
+    holdout results; they do not alter model evaluation or ranking.
+    """
+    if (
+        matrix.ndim != 2
+        or matrix.shape[0] != matrix.shape[1]
+        or len(labels) != matrix.shape[0]
+    ):
+        return ["No valid confusion matrix is available for observations."]
+
+    row_totals = matrix.sum(axis=1)
+    recalls = np.divide(
+        np.diag(matrix),
+        row_totals,
+        out=np.zeros(len(labels), dtype=float),
+        where=row_totals > 0,
+    )
+    best_index = int(np.argmax(recalls))
+    worst_index = int(np.argmin(recalls))
+    observations = [
+        f"Best classified class: {labels[best_index]} "
+        f"({recalls[best_index]:.0%} recall).",
+        f"Lowest recall class: {labels[worst_index]} "
+        f"({recalls[worst_index]:.0%} recall).",
+    ]
+    off_diagonal = matrix.copy()
+    np.fill_diagonal(off_diagonal, 0)
+    largest_error = int(off_diagonal.max())
+    if largest_error > 0:
+        actual_index, predicted_index = np.unravel_index(
+            off_diagonal.argmax(), off_diagonal.shape
+        )
+        observations.insert(
+            0,
+            f"Most confused classes: {labels[actual_index]} predicted as "
+            f"{labels[predicted_index]} ({largest_error} sessions).",
+        )
+    else:
+        observations.insert(0, "No cross-class confusions were observed in this holdout.")
+    return observations
+
+
+def get_best_model_evaluation(report: EvaluationReport) -> Optional[Dict[str, Any]]:
+    """Return the evaluated metrics for the report's selected best model."""
+    best_model = report.get("best_model", {}).get("model_name")
+    if not best_model:
+        return None
+    return next(
+        (item for item in _iter_evaluations(report) if item.get("model_name") == best_model),
+        None,
+    )
+
+
 def build_confusion_matrix_figure(matrix: np.ndarray, labels: List[str]) -> plt.Figure:
-    """Render a confusion matrix figure using matplotlib."""
-    fig, ax = plt.subplots(figsize=(6, 4))
+    """Render a compact, theme-compatible confusion matrix figure."""
+    fig, ax = plt.subplots(figsize=(5.4, 4.0))
+    fig.patch.set_alpha(0.0)
+    ax.set_facecolor("none")
     if matrix.size == 0:
-        ax.text(0.5, 0.5, "No confusion matrix data available", ha="center", va="center")
+        ax.text(
+            0.5,
+            0.5,
+            "No confusion matrix data available",
+            ha="center",
+            va="center",
+            color="#e5e7eb",
+            fontsize=11,
+        )
         ax.axis("off")
         return fig
     im = ax.imshow(matrix, cmap="Blues", interpolation="nearest")
-    fig.colorbar(im, ax=ax)
-    ax.set_xticks(np.arange(len(labels)))
-    ax.set_yticks(np.arange(len(labels)))
-    ax.set_xticklabels(labels, rotation=45, ha="right")
-    ax.set_yticklabels(labels)
-    ax.set_xlabel("Predicted label")
-    ax.set_ylabel("Actual label")
+    colorbar = fig.colorbar(im, ax=ax)
+    colorbar.ax.tick_params(colors="#e5e7eb", labelsize=9)
+    colorbar.outline.set_edgecolor("#9ca3af")
+    display_labels = [format_confusion_matrix_label(label) for label in labels]
+    ax.set_xticks(np.arange(len(display_labels)))
+    ax.set_yticks(np.arange(len(display_labels)))
+    ax.set_xticklabels(display_labels, fontsize=8, color="#e5e7eb")
+    ax.set_yticklabels(display_labels, fontsize=8, color="#e5e7eb")
+    ax.set_xlabel("Predicted label", fontsize=11, color="#e5e7eb")
+    ax.set_ylabel("Actual label", fontsize=11, color="#e5e7eb")
+    ax.tick_params(colors="#e5e7eb")
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#9ca3af")
     for i in range(matrix.shape[0]):
         for j in range(matrix.shape[1]):
-            ax.text(j, i, int(matrix[i, j]), ha="center", va="center", color="black")
-    fig.tight_layout()
+            ax.text(j, i, int(matrix[i, j]), ha="center", va="center", color="#111827", fontsize=10)
+    fig.tight_layout(pad=0.5)
     return fig
 
 
@@ -198,33 +336,84 @@ def feature_importance_dataframe(report: FeatureImportanceReport, top_n: int = 1
     ranking = report.get("ranking", [])[:top_n]
     rows = [
         {
-            "Feature": item.get("feature_name"),
-            "Importance": item.get("importance_score"),
-            "Normalized": item.get("normalized_score"),
+            "Top 5": int(item.get("rank", 0)) <= 5,
+            "Top 3": int(item.get("rank", 0)) <= 3,
             "Rank": item.get("rank"),
+            "Feature Name": item.get("feature_name"),
+            "Raw Importance": round(float(item.get("importance_score", 0.0)), 3),
+            "Normalized Importance": round(float(item.get("normalized_score", 0.0)), 3),
+            "Contribution": round(float(item.get("normalized_score", 0.0)) * 100, 1),
         }
         for item in ranking
     ]
     dataframe = pd.DataFrame(rows)
     if not dataframe.empty:
-        dataframe = dataframe.sort_values(by=["Importance", "Feature"], ascending=[False, True])
+        dataframe = dataframe.sort_values(by=["Rank", "Feature Name"], ascending=[True, True])
     return dataframe
 
 
 def feature_importance_figure(dataframe: pd.DataFrame) -> plt.Figure:
-    """Render a horizontal bar chart for feature importance."""
-    fig, ax = plt.subplots(figsize=(8, min(6, 0.35 * len(dataframe) + 1)))
+    """Render a compact, theme-compatible feature-importance chart."""
+    fig, ax = plt.subplots(figsize=(9.0, min(4.6, 0.28 * len(dataframe) + 1.0)))
+    fig.patch.set_alpha(0.0)
+    ax.set_facecolor("none")
     if dataframe.empty:
-        ax.text(0.5, 0.5, "No feature importance data available", ha="center", va="center")
+        ax.text(
+            0.5,
+            0.5,
+            "No feature importance data available",
+            ha="center",
+            va="center",
+            color="#e5e7eb",
+            fontsize=11,
+        )
         ax.axis("off")
         return fig
     df = dataframe.copy()
-    df = df.sort_values(by="Importance", ascending=True)
-    ax.barh(df["Feature"], df["Importance"], color="#2b8cc4")
-    ax.set_xlabel("Importance score")
-    ax.set_title("Top Feature Importance")
-    fig.tight_layout()
+    df = df.sort_values(by="Raw Importance", ascending=True)
+    bars = ax.barh(df["Feature Name"], df["Raw Importance"], color="#2b8cc4")
+    ax.set_xlabel("Raw importance score", fontsize=10, color="#e5e7eb")
+    ax.set_title("Top Feature Importance", fontsize=12, color="#f9fafb", pad=5)
+    ax.tick_params(axis="both", colors="#e5e7eb", labelsize=9)
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#9ca3af")
+    ax.bar_label(bars, fmt="%.3f", padding=2, color="#e5e7eb", fontsize=9)
+    fig.tight_layout(pad=0.5)
     return fig
+
+
+def build_model_insights(report: Optional[FeatureImportanceReport]) -> List[str]:
+    """Build concise, deterministic insights from an importance ranking."""
+    if not report:
+        return []
+    ranking = report.get("ranking", [])
+    top_features = [str(item.get("feature_name")) for item in ranking[:3] if item.get("feature_name")]
+    if not top_features:
+        return []
+    contribution = sum(float(item.get("normalized_score", 0.0)) for item in ranking[:3])
+    return [
+        "Primary prediction drivers:",
+        *top_features,
+        f"The top three signals account for {contribution:.0%} of normalized importance.",
+    ]
+
+
+def style_model_evaluation_dataframe(
+    dataframe: pd.DataFrame, best_model: Optional[str]
+) -> pd.io.formats.style.Styler:
+    """Apply subtle display-only highlighting to the recommended model row."""
+    if dataframe.empty or not best_model:
+        return dataframe.style
+
+    def highlight(row: pd.Series) -> List[str]:
+        color = (
+            "background-color: #173d31; color: #f3f4f6;"
+            if row["Model"] == best_model
+            else ""
+        )
+        return [color] * len(row)
+
+    return dataframe.style.apply(highlight, axis=1)
 
 
 def build_drift_summary(report: DriftReport) -> Tuple[Dict[str, Any], pd.DataFrame, pd.DataFrame]:
@@ -245,7 +434,10 @@ def _largest_shifted_feature(feature_drift: pd.DataFrame) -> str:
         return "None"
     if "jensen_shannon_divergence" not in feature_drift.columns:
         return "Unknown"
-    row = feature_drift.loc[feature_drift["jensen_shannon_divergence"].idxmax()]
+    if "shifted" not in feature_drift.columns or not feature_drift["shifted"].any():
+        return "None"
+    shifted = feature_drift[feature_drift["shifted"]]
+    row = shifted.loc[shifted["jensen_shannon_divergence"].idxmax()]
     return f"{row.get('feature_name', 'Unknown')} ({row.get('jensen_shannon_divergence', 0.0):.2f})"
 
 
@@ -342,7 +534,10 @@ def build_anomaly_summary(report: AnomalyReport) -> Tuple[Dict[str, Any], pd.Dat
         "Anomalies": report.get("anomaly_count", 0),
         "Noise points": report.get("noise_point_count", 0),
         "Unknown failure candidates": report.get("unknown_failure_count", 0),
-        "Cluster groups": len(report.get("cluster_statistics", [])),
+        "Cluster count": sum(
+            not bool(item.get("is_noise", False))
+            for item in report.get("cluster_statistics", [])
+        ),
     }
     cluster_df = pd.DataFrame(report.get("cluster_statistics", []))
     if not cluster_df.empty:
@@ -350,6 +545,44 @@ def build_anomaly_summary(report: AnomalyReport) -> Tuple[Dict[str, Any], pd.Dat
             columns={"cluster_id": "Cluster ID", "session_count": "Session count", "is_noise": "Noise"}
         )
     return summary, cluster_df
+
+
+def build_analytics_summary(
+    stats: Optional[DatasetStatistics],
+    dataset: Optional[MLDataset],
+    evaluation_report: Optional[EvaluationReport],
+    drift_report: Optional[DriftReport],
+    anomaly_report: Optional[AnomalyReport],
+) -> Dict[str, str]:
+    """Build compact display values for the analytics-page summary panel."""
+    cards = (
+        build_dataset_card_values(stats, dataset, evaluation_report)
+        if stats is not None and dataset is not None
+        else {}
+    )
+    best_evaluation = get_best_model_evaluation(evaluation_report or {})
+    metrics = best_evaluation.get("metrics", {}) if best_evaluation else {}
+    shifted_count = (drift_report or {}).get("summary", {}).get("shifted_feature_count", 0)
+    drift_status = "Unavailable" if drift_report is None else (
+        "No significant drift" if not shifted_count else f"{shifted_count} shifted features"
+    )
+    return {
+        "Sessions analysed": str(cards.get("Number of sessions", "Unavailable")),
+        "Features": str(cards.get("Number of features", "Unavailable")),
+        "Best model": (
+            str(best_evaluation.get("model_name", "Unavailable"))
+            if best_evaluation
+            else "Unavailable"
+        ),
+        "Accuracy": (
+            f"{float(metrics.get('accuracy', 0.0)):.1%}"
+            if best_evaluation
+            else "Unavailable"
+        ),
+        "Drift status": drift_status,
+        "Anomalies": str((anomaly_report or {}).get("anomaly_count", "Unavailable")),
+        "Train/Test split": str(cards.get("Train/Test split", "Unavailable")),
+    }
 
 
 def write_temp_jsonl(data: bytes, suffix: str) -> Path:
@@ -494,6 +727,7 @@ def _render_dataset_overview(
     dataset_statistics: Optional[DatasetStatistics],
     dataset: Optional[MLDataset],
     dataset_error: Optional[str],
+    evaluation_report: Optional[EvaluationReport],
 ) -> None:
     st.subheader("Dataset Overview")
     if dataset_error:
@@ -503,25 +737,66 @@ def _render_dataset_overview(
         st.info("No dataset is currently available for overview. Upload a dataset and press Run ML Analytics.")
         return
 
-    overview_values = build_dataset_card_values(dataset_statistics, dataset, None)
-    metrics = st.columns(4)
-    metrics[0].metric("Sessions", overview_values["Number of sessions"])
-    metrics[1].metric("Features", overview_values["Number of features"])
-    metrics[2].metric("Failure categories", overview_values["Failure categories"])
-    metrics[3].metric("Missing values", overview_values["Missing values"])
+    overview_values = build_dataset_card_values(
+        dataset_statistics, dataset, evaluation_report
+    )
+    with _card_container(st):
+        metrics = st.columns(4)
+        metrics[0].metric("Sessions", overview_values["Number of sessions"])
+        metrics[1].metric("Features", overview_values["Number of features"])
+        metrics[2].metric("Failure categories", overview_values["Failure categories"])
+        metrics[3].metric("Missing values", overview_values["Missing values"])
     st.markdown(f"**Train/Test split:** {overview_values['Train/Test split']}")
     st.caption(overview_values["Dataset summary"])
     missing_df = pd.DataFrame(
         sorted(dataset_statistics.missing_values.items(), key=lambda item: item[1], reverse=True),
         columns=["Feature", "Missing values"],
     )
-    if not missing_df.empty:
+    total_missing = int(missing_df["Missing values"].sum()) if not missing_df.empty else 0
+    if total_missing == 0:
+        st.success("No missing values detected")
+        st.caption(f"{overview_values['Number of features']}/{overview_values['Number of features']} features complete")
+    else:
         st.write("##### Missing values by feature")
         st.dataframe(missing_df.head(15), use_container_width=True)
 
 
-def _render_model_evaluation(st: Any, evaluation_report: Optional[EvaluationReport]) -> None:
+def _render_analytics_summary(
+    st: Any,
+    dataset_statistics: Optional[DatasetStatistics],
+    dataset: Optional[MLDataset],
+    evaluation_report: Optional[EvaluationReport],
+    drift_report: Optional[DriftReport],
+    anomaly_report: Optional[AnomalyReport],
+) -> None:
+    """Render the compact, report-derived overview at the top of analytics."""
+    summary = build_analytics_summary(
+        dataset_statistics,
+        dataset,
+        evaluation_report,
+        drift_report,
+        anomaly_report,
+    )
+    with _card_container(st):
+        st.write("##### Analytics summary")
+        first_row = st.columns(4)
+        first_row[0].metric("Sessions analysed", summary["Sessions analysed"])
+        first_row[1].metric("Features", summary["Features"])
+        first_row[2].metric("Best model", summary["Best model"])
+        first_row[3].metric("Accuracy", summary["Accuracy"])
+        second_row = st.columns(3)
+        second_row[0].metric("Drift status", summary["Drift status"])
+        second_row[1].metric("Anomalies", summary["Anomalies"])
+        second_row[2].metric("Train/Test split", summary["Train/Test split"])
+
+
+def _render_model_evaluation(
+    st: Any,
+    evaluation_report: Optional[EvaluationReport],
+    importance_reports: Optional[List[FeatureImportanceReport]] = None,
+) -> None:
     st.subheader("Model Evaluation")
+    st.caption("Compares offline models used to classify interview failure categories.")
     if evaluation_report is None:
         st.info("Run ML Analytics to generate model evaluation metrics.")
         return
@@ -532,17 +807,56 @@ def _render_model_evaluation(st: Any, evaluation_report: Optional[EvaluationRepo
         st.info("No valid evaluation metrics were generated for this dataset.")
         return
 
+    best_evaluation = get_best_model_evaluation(evaluation_report)
+    best_model = best_evaluation.get("model_name") if best_evaluation else None
+    if best_evaluation:
+        best_metrics = best_evaluation.get("metrics", {})
+        with _card_container(st):
+            st.write("##### Recommended model")
+            metric_columns = st.columns(5)
+            metric_columns[0].metric("Model", str(best_model))
+            metric_columns[1].metric("Accuracy", f"{float(best_metrics.get('accuracy', 0.0)):.1%}")
+            metric_columns[2].metric("Precision", f"{float(best_metrics.get('precision', 0.0)):.1%}")
+            metric_columns[3].metric("Recall", f"{float(best_metrics.get('recall', 0.0)):.1%}")
+            metric_columns[4].metric("F1 Score", f"{float(best_metrics.get('f1_score', 0.0)):.1%}")
+            st.info(
+                f"{best_model} achieved the highest overall performance and is "
+                "recommended for deployment on this dataset."
+            )
+        insights = build_model_insights((importance_reports or [None])[0])
+        if insights:
+            with _card_container(st):
+                st.write("##### Model Insights")
+                st.write(f"- **{insights[0]}**")
+                for feature_name in insights[1:-1]:
+                    st.write(f"  - {feature_name}")
+                st.caption(insights[-1])
     st.write("##### Comparison of offline model evaluation metrics")
-    st.dataframe(eval_df, use_container_width=True)
+    st.dataframe(
+        style_model_evaluation_dataframe(eval_df, best_model),
+        use_container_width=True,
+        hide_index=True,
+    )
     model_names = evaluation_model_options(reports)
     selected_model = st.selectbox("Select model for confusion matrix", model_names, index=0)
     confusion_matrix, class_labels = get_confusion_matrix(reports[0], selected_model)
-    st.write("##### Confusion matrix")
-    st.pyplot(build_confusion_matrix_figure(confusion_matrix, class_labels))
+    matrix_column, observation_column = st.columns([3, 2])
+    with matrix_column:
+        st.write("##### Confusion matrix")
+        _render_figure(st, build_confusion_matrix_figure(confusion_matrix, class_labels))
+        st.caption(summarize_confusion_matrix(confusion_matrix, class_labels))
+    with observation_column:
+        with _card_container(st):
+            st.write("##### Observations")
+            for observation in build_confusion_matrix_observations(
+                confusion_matrix, class_labels
+            ):
+                st.write(f"- {observation}")
 
 
 def _render_feature_importance(st: Any, importance_reports: List[FeatureImportanceReport]) -> None:
     st.subheader("Feature Importance")
+    st.caption("Ranks telemetry features by their influence on model predictions.")
     if not importance_reports:
         st.info("Run ML Analytics to generate feature importance reports.")
         return
@@ -555,31 +869,79 @@ def _render_feature_importance(st: Any, importance_reports: List[FeatureImportan
         (report for report in importance_reports if report.get("model_name") == selected_feature_model),
         importance_reports[0],
     )
+    query = st.text_input("Search feature names", help="Filter the feature ranking by name.")
     importance_df = feature_importance_dataframe(model_report, top_n=15)
+    if query:
+        importance_df = importance_df[
+            importance_df["Feature Name"].str.contains(query, case=False, na=False)
+        ]
     st.write("##### Top 15 features")
-    st.dataframe(importance_df, use_container_width=True)
-    st.pyplot(feature_importance_figure(importance_df))
+    dataframe_options: Dict[str, Any] = {
+        "use_container_width": True,
+        "hide_index": True,
+    }
+    if hasattr(st, "column_config"):
+        dataframe_options["column_config"] = {
+            "Top 3": st.column_config.CheckboxColumn(
+                "Top 3", help="Highlights the three leading features."
+            ),
+            "Top 5": st.column_config.CheckboxColumn(
+                "Top 5", help="Marks the five leading features."
+            ),
+            "Contribution": st.column_config.ProgressColumn(
+                "Contribution",
+                help="Normalized importance contribution.",
+                min_value=0,
+                max_value=100,
+                format="%.1f%%",
+            ),
+        }
+    st.dataframe(importance_df, **dataframe_options)
+    _render_figure(st, feature_importance_figure(importance_df))
 
 
 def _render_drift_detection(st: Any, drift_report: Optional[DriftReport]) -> None:
     st.subheader("Drift Detection")
+    st.caption("Drift compares the uploaded dataset with the baseline reference dataset.")
     if drift_report is None:
         st.info("Run ML Analytics to generate drift detection analytics.")
         return
 
     drift_values, feature_drift_df, label_drift_df = build_drift_summary(drift_report)
+    overall_drift = float(drift_values["Overall drift score"])
+    if overall_drift == 0.0:
+        st.success("Dataset matches baseline")
+        st.caption("No shifted features detected.")
+        with st.expander("Show detailed drift metrics"):
+            st.dataframe(label_drift_df, use_container_width=True, hide_index=True)
+        return
+
     drift_cols = st.columns(3)
     drift_cols[0].metric("Overall drift score", f"{drift_values['Overall drift score']:.3f}")
-    drift_cols[1].metric("Largest shifted feature", drift_values["Largest shifted feature"])
+    shifted_features = feature_drift_df[
+        feature_drift_df.get("shifted", pd.Series(dtype=bool)).astype(bool)
+    ] if "shifted" in feature_drift_df else feature_drift_df
+    if drift_values["Largest shifted feature"] == "None":
+        st.success(
+            "No significant drift detected. The uploaded dataset remains aligned "
+            "with the baseline."
+        )
+    else:
+        st.warning("Significant drift detected. Review the shifted telemetry features below.")
+        drift_cols[1].metric("Largest shifted feature", drift_values["Largest shifted feature"])
     drift_cols[2].metric("Average drift", f"{drift_values['Average drift']:.3f}")
-    st.write("##### Feature drift")
-    st.dataframe(style_feature_drift_dataframe(feature_drift_df), use_container_width=True)
+    st.write("##### Shifted features")
+    if shifted_features.empty:
+        st.caption("No features exceeded the configured drift threshold.")
+    else:
+        st.dataframe(style_feature_drift_dataframe(shifted_features), use_container_width=True)
     st.write("##### Label drift")
     st.dataframe(style_label_drift_dataframe(label_drift_df), use_container_width=True)
 
 
 def _render_anomaly_detection(st: Any, anomaly_report: Optional[AnomalyReport]) -> None:
     st.subheader("Anomaly Detection")
+    st.caption("Identifies unusual interview sessions using unsupervised learning.")
     if anomaly_report is None:
         st.info("Run ML Analytics to generate anomaly detection analytics.")
         return
@@ -589,19 +951,29 @@ def _render_anomaly_detection(st: Any, anomaly_report: Optional[AnomalyReport]) 
     anomaly_cols[0].metric("Anomalies", anomaly_summary["Anomalies"])
     anomaly_cols[1].metric("Noise points", anomaly_summary["Noise points"])
     anomaly_cols[2].metric("Unknown failures", anomaly_summary["Unknown failure candidates"])
-    anomaly_cols[3].metric("Cluster groups", anomaly_summary["Cluster groups"])
-    if not cluster_df.empty:
+    anomaly_cols[3].metric("Cluster count", anomaly_summary["Cluster count"])
+    if int(anomaly_summary["Cluster count"]) == 0:
+        st.info(
+            "No meaningful clusters were identified in the uploaded dataset.\n\n"
+            "This is expected when the uploaded data closely matches the baseline reference."
+        )
+    elif int(anomaly_summary["Cluster count"]) == 1:
+        st.info(
+            "The uploaded dataset does not contain sufficient separable structure for "
+            "meaningful clustering. This is expected when analysing the baseline dataset."
+        )
+    else:
         st.write("##### DBSCAN cluster statistics")
         st.dataframe(cluster_df, use_container_width=True)
     records = anomaly_report.get("records")
     if isinstance(records, list) and records:
-        st.write("##### Anomaly records")
-        st.dataframe(
-            pd.DataFrame(records)[
-                ["session_id", "anomaly_score", "is_anomaly", "cluster_id", "is_noise", "is_unknown_failure"]
-            ],
-            use_container_width=True,
-        )
+        with st.expander("Show anomaly records"):
+            st.dataframe(
+                pd.DataFrame(records)[
+                    ["session_id", "anomaly_score", "is_anomaly", "cluster_id", "is_noise", "is_unknown_failure"]
+                ],
+                use_container_width=True,
+            )
 
 
 def _render_export_buttons(
@@ -611,40 +983,33 @@ def _render_export_buttons(
     drift_report: Optional[DriftReport],
     anomaly_report: Optional[AnomalyReport],
 ) -> None:
-    st.subheader("Export ML Reports")
-    eval_payload = create_download_payload(evaluation_report)
-    importance_payload = create_download_payload(importance_reports[0] if importance_reports else None)
-    drift_payload = create_download_payload(drift_report)
-    anomaly_payload = create_download_payload(anomaly_report)
-    export_cols = st.columns(4)
-    export_cols[0].download_button(
-        "Download evaluation report",
-        data=eval_payload or "{}",
-        file_name="evaluation_report.json",
-        mime="application/json",
-        disabled=eval_payload is None,
-    )
-    export_cols[1].download_button(
-        "Download feature importance report",
-        data=importance_payload or "{}",
-        file_name="feature_importance_report.json",
-        mime="application/json",
-        disabled=importance_payload is None,
-    )
-    export_cols[2].download_button(
-        "Download drift report",
-        data=drift_payload or "{}",
-        file_name="drift_report.json",
-        mime="application/json",
-        disabled=drift_payload is None,
-    )
-    export_cols[3].download_button(
-        "Download anomaly report",
-        data=anomaly_payload or "{}",
-        file_name="anomaly_report.json",
-        mime="application/json",
-        disabled=anomaly_payload is None,
-    )
+    with _card_container(st):
+        st.subheader("Reports")
+        st.caption(
+            "Download the unchanged, serializable outputs from each offline "
+            "analytics stage."
+        )
+        eval_payload = create_download_payload(evaluation_report)
+        importance_payload = create_download_payload(importance_reports[0] if importance_reports else None)
+        drift_payload = create_download_payload(drift_report)
+        anomaly_payload = create_download_payload(anomaly_report)
+        export_cols = st.columns(4)
+        export_cols[0].download_button(
+            "Download evaluation report", data=eval_payload or "{}", file_name="evaluation_report.json",
+            mime="application/json", disabled=eval_payload is None,
+        )
+        export_cols[1].download_button(
+            "Download feature importance report", data=importance_payload or "{}", file_name="feature_importance_report.json",
+            mime="application/json", disabled=importance_payload is None,
+        )
+        export_cols[2].download_button(
+            "Download drift report", data=drift_payload or "{}", file_name="drift_report.json",
+            mime="application/json", disabled=drift_payload is None,
+        )
+        export_cols[3].download_button(
+            "Download anomaly report", data=anomaly_payload or "{}", file_name="anomaly_report.json",
+            mime="application/json", disabled=anomaly_payload is None,
+        )
 
 
 def render_ml_analytics() -> None:
@@ -723,9 +1088,28 @@ def render_ml_analytics() -> None:
     else:
         ml_results = None
 
-    _render_dataset_overview(st, dataset_statistics, dataset, dataset_error)
+    _render_analytics_summary(
+        st,
+        dataset_statistics,
+        dataset,
+        ml_results["evaluation_report"] if ml_results else None,
+        ml_results["drift_report"] if ml_results else None,
+        ml_results["anomaly_report"] if ml_results else None,
+    )
     st.markdown("---")
-    _render_model_evaluation(st, ml_results["evaluation_report"] if ml_results else None)
+    _render_dataset_overview(
+        st,
+        dataset_statistics,
+        dataset,
+        dataset_error,
+        ml_results["evaluation_report"] if ml_results else None,
+    )
+    st.markdown("---")
+    _render_model_evaluation(
+        st,
+        ml_results["evaluation_report"] if ml_results else None,
+        ml_results["feature_importance_reports"] if ml_results else [],
+    )
     st.markdown("---")
     _render_feature_importance(st, ml_results["feature_importance_reports"] if ml_results else [])
     st.markdown("---")

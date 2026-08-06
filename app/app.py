@@ -68,7 +68,7 @@ def _render_project_sidebar() -> None:
     """Render static project information and the backend pipeline overview."""
     st.sidebar.title("AI Interview Debugger")
     st.sidebar.caption("Explainable AI interview observability")
-    st.sidebar.success("Backend status: 85 tests passing")
+    st.sidebar.success("Backend status: 100 tests passing")
     st.sidebar.divider()
     st.sidebar.subheader("Versions")
     st.sidebar.write("Dataset: `from uploaded session`")
@@ -112,8 +112,8 @@ def _render_footer() -> None:
     """Render concise project runtime details at the bottom of the dashboard."""
     st.divider()
     st.caption(
-        "Author: AI Interview Debugger Team  ·  Python 3.12  ·  "
-        "Streamlit  ·  Project version: 1.0"
+        "AI Interview Debugger  ·  Version 1.0  ·  Python 3.12  ·  "
+        "Streamlit  ·  100 automated tests"
     )
 
 

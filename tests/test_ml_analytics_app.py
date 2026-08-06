@@ -77,8 +77,15 @@ def test_feature_importance_dataframe_returns_top_features() -> None:
         ],
     }
     df = feature_importance_dataframe(report, top_n=2)
-    assert df.iloc[0]["Feature"] == "f1"
-    assert df.iloc[1]["Feature"] == "f2"
+    first_row = df.iloc[0]
+    second_row = df.iloc[1]
+
+    assert first_row["Feature Name"] == "f1"
+    assert first_row["Rank"] == 1
+    assert first_row["Raw Importance"] == 0.6
+    assert first_row["Normalized Importance"] == 0.5
+    assert bool(first_row["Top 5"])
+    assert second_row["Feature Name"] == "f2"
 
 
 def test_load_dataset_statistics_default_sample() -> None:
