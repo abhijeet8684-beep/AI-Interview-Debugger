@@ -10,22 +10,34 @@ from __future__ import annotations
 
 import json
 import tempfile
+from hashlib import sha256
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
+from ml.anomaly_detection import AnomalyDetector
 from ml.dataset_loader import DatasetLoader, DatasetStatistics, MLDataset
+from ml.drift_detection import DriftDetector
+from ml.evaluate_models import EvaluationReport as EvaluationReportObject, ModelEvaluator
+from ml.feature_importance import FeatureImportanceAnalyzer, FeatureImportanceReport as FeatureImportanceReportObject
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATASET_PATH = PROJECT_ROOT / "data" / "synthetic" / "interview_sessions.jsonl"
+DEFAULT_DATASET_KEY = "default_sample_dataset"
 
 EvaluationReport = Dict[str, Any]
 FeatureImportanceReport = Dict[str, Any]
 DriftReport = Dict[str, Any]
 AnomalyReport = Dict[str, Any]
+ProgressCallback = Callable[[int, str], None]
 
 
 def load_json_report(data: bytes) -> Optional[Dict[str, Any]]:
@@ -248,9 +260,24 @@ def style_feature_drift_dataframe(feature_df: pd.DataFrame) -> pd.io.formats.sty
             "shifted": "Shifted",
         }
     )
-    return renamed.style.format(
-        {"JS Divergence": "{:.3f}", "PSI": "{:.3f}"}
-    ).applymap(_drift_color, subset=["JS Divergence"]).applymap(_shifted_color, subset=["Shifted"])
+    styler = renamed.style.format({"JS Divergence": "{:.3f}", "PSI": "{:.3f}"})
+    try:
+        # Preferred styling: applymap if available.
+        if hasattr(styler, "applymap"):
+            styler = styler.applymap(_drift_color, subset=["JS Divergence"]).applymap(
+                _shifted_color, subset=["Shifted"]
+            )
+        else:
+            # Fallback: use apply on the column series to return per-cell styles.
+            styler = styler.apply(lambda s: s.map(_drift_color), subset=["JS Divergence"])
+            styler = styler.apply(lambda s: s.map(_shifted_color), subset=["Shifted"])
+    except Exception:
+        # If any styling fails (pandas incompatibility), return an unstyled styler with formatting.
+        try:
+            return renamed.style.format({"JS Divergence": "{:.3f}", "PSI": "{:.3f}"})
+        except Exception:
+            return renamed.style
+    return styler
 
 
 def _drift_color(value: Any) -> str:
@@ -283,9 +310,18 @@ def style_label_drift_dataframe(label_df: pd.DataFrame) -> pd.io.formats.style.S
             "percentage_change": "Change %",
         }
     )
-    return renamed.style.format(
-        {"Baseline %": "{:.1f}", "Current %": "{:.1f}", "Change %": "{:+.1f}"}
-    ).applymap(_label_drift_color, subset=["Change %"])
+    styler = renamed.style.format({"Baseline %": "{:.1f}", "Current %": "{:.1f}", "Change %": "{:+.1f}"})
+    try:
+        if hasattr(styler, "applymap"):
+            styler = styler.applymap(_label_drift_color, subset=["Change %"])
+        else:
+            styler = styler.apply(lambda s: s.map(_label_drift_color), subset=["Change %"])
+    except Exception:
+        try:
+            return renamed.style.format({"Baseline %": "{:.1f}", "Current %": "{:.1f}", "Change %": "{:+.1f}"})
+        except Exception:
+            return renamed.style
+    return styler
 
 
 def _label_drift_color(value: Any) -> str:
@@ -336,195 +372,248 @@ def load_dataset_from_bytes(data: bytes, suffix: str) -> Tuple[DatasetStatistics
             pass
 
 
+def dataset_cache_key(file_name: Optional[str], data: Optional[bytes]) -> str:
+    """Generate a stable hash key for an uploaded dataset file.
+
+    The key is used to cache ML analytics results for the same dataset content.
+    """
+    hasher = sha256()
+    hasher.update((file_name or DEFAULT_DATASET_KEY).encode("utf-8"))
+    if data is not None:
+        hasher.update(data)
+    return hasher.hexdigest()
+
+
+def _report_progress(callback: Optional[ProgressCallback], percent: int, message: str) -> None:
+    if callback is None:
+        return
+    callback(percent, message)
+
+
+def _feature_label_array(dataset: MLDataset, label_name: str = "failure_category") -> np.ndarray:
+    label_mapping = {
+        "root_cause": "root_causes",
+        "root_causes": "root_causes",
+        "affected_component": "affected_components",
+        "affected_components": "affected_components",
+        "failure_category": "failure_categories",
+        "failure_categories": "failure_categories",
+    }
+    mapped_name = label_mapping.get(label_name)
+    if mapped_name is None or mapped_name not in dataset.labels.__dict__:
+        raise ValueError(f"Unsupported label name: {label_name}")
+    labels = getattr(dataset.labels, mapped_name)
+    if labels is None:
+        raise ValueError(f"Dataset is missing '{mapped_name}' labels.")
+    return np.asarray([str(label) for label in labels], dtype=str)
+
+
+def _make_model_pipelines(random_state: int = 42) -> Dict[str, Pipeline]:
+    return {
+        "Logistic Regression": Pipeline(
+            [
+                ("imputer", SimpleImputer()),
+                ("scaler", StandardScaler()),
+                (
+                    "classifier",
+                    LogisticRegression(random_state=random_state, max_iter=1000),
+                ),
+            ]
+        ),
+        "Random Forest": Pipeline(
+            [
+                ("imputer", SimpleImputer()),
+                (
+                    "classifier",
+                    RandomForestClassifier(random_state=random_state, n_estimators=100),
+                ),
+            ]
+        ),
+        "Gradient Boosting": Pipeline(
+            [
+                ("imputer", SimpleImputer()),
+                (
+                    "classifier",
+                    GradientBoostingClassifier(random_state=random_state, n_estimators=100),
+                ),
+            ]
+        ),
+    }
+
+
+def run_ml_analytics(
+    dataset: MLDataset,
+    baseline_dataset: MLDataset,
+    random_state: int = 42,
+    progress_callback: Optional[ProgressCallback] = None,
+) -> Dict[str, Any]:
+    """Execute the ML analytics workflow and return serializable reports."""
+    _report_progress(progress_callback, 5, "Validating dataset and labels...")
+    model_evaluator = ModelEvaluator(random_state=random_state)
+    _report_progress(progress_callback, 20, "Training and evaluating models...")
+    evaluation_report: EvaluationReportObject = model_evaluator.evaluate(dataset)
+    _report_progress(progress_callback, 45, "Computing feature importance...")
+    feature_analyzer = FeatureImportanceAnalyzer(random_state=random_state)
+    labels = _feature_label_array(dataset)
+    feature_importance_reports: List[FeatureImportanceReportObject] = []
+    for _, pipeline in _make_model_pipelines(random_state).items():
+        fitted_pipeline = pipeline.fit(dataset.features, labels)
+        try:
+            report = feature_analyzer.analyze(
+                fitted_pipeline,
+                tuple(dataset.feature_names),
+                dataset.features,
+                labels,
+            )
+            feature_importance_reports.append(report)
+        except Exception:
+            continue
+    _report_progress(progress_callback, 65, "Running drift detection...")
+    drift_detector = DriftDetector()
+    drift_report = drift_detector.compare(baseline_dataset, dataset)
+    _report_progress(progress_callback, 85, "Running anomaly detection...")
+    anomaly_detector = AnomalyDetector(random_state=random_state)
+    anomaly_report = anomaly_detector.analyze(dataset)
+    _report_progress(progress_callback, 100, "ML analytics complete.")
+    return {
+        "evaluation_report": evaluation_report.to_dict(),
+        "feature_importance_reports": [report.to_dict() for report in feature_importance_reports],
+        "drift_report": drift_report.to_dict(),
+        "anomaly_report": anomaly_report.to_dict(),
+    }
+
+
 def create_download_payload(report: Optional[Dict[str, Any]]) -> Optional[str]:
     if report is None:
         return None
     return json.dumps(report, indent=2, sort_keys=True)
 
 
-def render_ml_analytics() -> None:
-    """Render the ML analytics tab for the Streamlit dashboard."""
-    import streamlit as st
-
-    st.header("📊 ML Analytics")
-    st.write(
-        "Visualize offline ML analytics reports for dataset overview, model evaluation, "
-        "feature importance, drift detection, and anomaly analysis. Upload report "
-        "JSON files to populate the dashboard sections."
-    )
-
-    with st.expander("Load offline ML reports and dataset", expanded=True):
-        dataset_col, report_col = st.columns([2, 3])
-        dataset_file = dataset_col.file_uploader(
-            "Dataset file",
-            type=["jsonl", "ndjson", "csv"],
-            key="ml_dataset",
-            help="Upload a synthetic dataset or use the built-in sample dataset.",
-        )
-        evaluation_files = report_col.file_uploader(
-            "Evaluation report JSON",
-            type=["json"],
-            accept_multiple_files=True,
-            key="ml_evaluation_reports",
-            help="Upload one or more model evaluation report JSON files.",
-        )
-        importance_files = report_col.file_uploader(
-            "Feature importance JSON",
-            type=["json"],
-            accept_multiple_files=True,
-            key="ml_importance_reports",
-            help="Upload feature importance reports for one or more models.",
-        )
-        drift_file = report_col.file_uploader(
-            "Drift report JSON",
-            type=["json"],
-            key="ml_drift_report",
-            help="Upload a drift detection report JSON file.",
-        )
-        anomaly_file = report_col.file_uploader(
-            "Anomaly report JSON",
-            type=["json"],
-            key="ml_anomaly_report",
-            help="Upload an anomaly detection report JSON file.",
-        )
-
-    dataset_statistics: Optional[DatasetStatistics] = None
-    dataset: Optional[MLDataset] = None
-    dataset_error: Optional[str] = None
-    try:
-        if dataset_file is not None:
-            suffix = Path(dataset_file.name).suffix or ".jsonl"
-            dataset_statistics, dataset = load_dataset_from_bytes(dataset_file.getvalue(), suffix)
-        else:
-            dataset_statistics, dataset = load_dataset_statistics()
-    except Exception as error:
-        dataset_error = str(error)
-
-    evaluation_reports: List[EvaluationReport] = []
-    for uploaded in evaluation_files or []:
-        report = load_json_report(uploaded.getvalue())
-        if report is not None:
-            evaluation_reports.append(report)
-
-    importance_reports: List[FeatureImportanceReport] = []
-    for uploaded in importance_files or []:
-        report = load_json_report(uploaded.getvalue())
-        if report is not None:
-            importance_reports.append(report)
-
-    drift_report = load_json_report(drift_file.getvalue()) if drift_file is not None else None
-    anomaly_report = load_json_report(anomaly_file.getvalue()) if anomaly_file is not None else None
-
+def _render_dataset_overview(
+    st: Any,
+    dataset_statistics: Optional[DatasetStatistics],
+    dataset: Optional[MLDataset],
+    dataset_error: Optional[str],
+) -> None:
     st.subheader("Dataset Overview")
     if dataset_error:
         st.error(f"Unable to load dataset: {dataset_error}")
-    elif dataset_statistics is None or dataset is None:
-        st.info("No dataset is currently available for overview.")
-    else:
-        overview_values = build_dataset_card_values(
-            dataset_statistics, dataset, evaluation_reports[0] if evaluation_reports else None
-        )
-        metrics = st.columns(4)
-        metrics[0].metric("Sessions", overview_values["Number of sessions"])
-        metrics[1].metric("Features", overview_values["Number of features"])
-        metrics[2].metric("Failure categories", overview_values["Failure categories"])
-        metrics[3].metric("Missing values", overview_values["Missing values"])
-        st.markdown(f"**Train/Test split:** {overview_values['Train/Test split']}")
-        st.caption(overview_values["Dataset summary"])
-        missing_df = pd.DataFrame(
-            sorted(dataset_statistics.missing_values.items(), key=lambda item: item[1], reverse=True),
-            columns=["Feature", "Missing values"],
-        )
-        if not missing_df.empty:
-            st.write("##### Missing values by feature")
-            st.dataframe(missing_df.head(15), use_container_width=True)
+        return
+    if dataset_statistics is None or dataset is None:
+        st.info("No dataset is currently available for overview. Upload a dataset and press Run ML Analytics.")
+        return
 
-    st.markdown("---")
+    overview_values = build_dataset_card_values(dataset_statistics, dataset, None)
+    metrics = st.columns(4)
+    metrics[0].metric("Sessions", overview_values["Number of sessions"])
+    metrics[1].metric("Features", overview_values["Number of features"])
+    metrics[2].metric("Failure categories", overview_values["Failure categories"])
+    metrics[3].metric("Missing values", overview_values["Missing values"])
+    st.markdown(f"**Train/Test split:** {overview_values['Train/Test split']}")
+    st.caption(overview_values["Dataset summary"])
+    missing_df = pd.DataFrame(
+        sorted(dataset_statistics.missing_values.items(), key=lambda item: item[1], reverse=True),
+        columns=["Feature", "Missing values"],
+    )
+    if not missing_df.empty:
+        st.write("##### Missing values by feature")
+        st.dataframe(missing_df.head(15), use_container_width=True)
+
+
+def _render_model_evaluation(st: Any, evaluation_report: Optional[EvaluationReport]) -> None:
     st.subheader("Model Evaluation")
-    if not evaluation_reports:
-        st.info("Upload at least one evaluation report JSON file to visualize model metrics.")
-    else:
-        eval_df = build_evaluation_dataframe(evaluation_reports)
-        if eval_df.empty:
-            st.info("Evaluation reports were loaded but did not contain valid model summaries.")
-        else:
-            st.write("##### Comparison of offline model evaluation metrics")
-            st.dataframe(eval_df, use_container_width=True)
-            model_names = evaluation_model_options(evaluation_reports)
-            selected_model = st.selectbox(
-                "Select model for confusion matrix", model_names, index=0
-            )
-            confusion_matrix, class_labels = np.empty((0, 0), dtype=int), []
-            for report in evaluation_reports:
-                matrix, labels = get_confusion_matrix(report, selected_model)
-                if matrix.size:
-                    confusion_matrix, class_labels = matrix, labels
-                    break
-            st.write("##### Confusion matrix")
-            st.pyplot(build_confusion_matrix_figure(confusion_matrix, class_labels))
+    if evaluation_report is None:
+        st.info("Run ML Analytics to generate model evaluation metrics.")
+        return
 
-    st.markdown("---")
+    reports = [evaluation_report]
+    eval_df = build_evaluation_dataframe(reports)
+    if eval_df.empty:
+        st.info("No valid evaluation metrics were generated for this dataset.")
+        return
+
+    st.write("##### Comparison of offline model evaluation metrics")
+    st.dataframe(eval_df, use_container_width=True)
+    model_names = evaluation_model_options(reports)
+    selected_model = st.selectbox("Select model for confusion matrix", model_names, index=0)
+    confusion_matrix, class_labels = get_confusion_matrix(reports[0], selected_model)
+    st.write("##### Confusion matrix")
+    st.pyplot(build_confusion_matrix_figure(confusion_matrix, class_labels))
+
+
+def _render_feature_importance(st: Any, importance_reports: List[FeatureImportanceReport]) -> None:
     st.subheader("Feature Importance")
-    valid_importance_reports = build_feature_importance_reports(importance_reports)
-    if not valid_importance_reports:
-        st.info("Upload feature importance JSON reports to compare model explainability.")
-    else:
-        importance_options = feature_importance_model_options(valid_importance_reports)
-        selected_feature_model = st.selectbox(
-            "Select model for feature importance", importance_options, index=0
-        )
-        model_report = next(
-            (report for report in valid_importance_reports if report.get("model_name") == selected_feature_model),
-            valid_importance_reports[0],
-        )
-        importance_df = feature_importance_dataframe(model_report, top_n=15)
-        st.write("##### Top 15 features")
-        st.dataframe(importance_df, use_container_width=True)
-        st.pyplot(feature_importance_figure(importance_df))
+    if not importance_reports:
+        st.info("Run ML Analytics to generate feature importance reports.")
+        return
 
-    st.markdown("---")
+    importance_options = feature_importance_model_options(importance_reports)
+    selected_feature_model = st.selectbox(
+        "Select model for feature importance", importance_options, index=0
+    )
+    model_report = next(
+        (report for report in importance_reports if report.get("model_name") == selected_feature_model),
+        importance_reports[0],
+    )
+    importance_df = feature_importance_dataframe(model_report, top_n=15)
+    st.write("##### Top 15 features")
+    st.dataframe(importance_df, use_container_width=True)
+    st.pyplot(feature_importance_figure(importance_df))
+
+
+def _render_drift_detection(st: Any, drift_report: Optional[DriftReport]) -> None:
     st.subheader("Drift Detection")
     if drift_report is None:
-        st.info("Upload a drift report JSON file to display feature and label drift analytics.")
-    else:
-        drift_values, feature_drift_df, label_drift_df = build_drift_summary(drift_report)
-        drift_cols = st.columns(3)
-        drift_cols[0].metric("Overall drift score", f"{drift_values['Overall drift score']:.3f}")
-        drift_cols[1].metric("Largest shifted feature", drift_values["Largest shifted feature"])
-        drift_cols[2].metric("Average drift", f"{drift_values['Average drift']:.3f}")
-        st.write("##### Feature drift")
-        st.dataframe(style_feature_drift_dataframe(feature_drift_df), use_container_width=True)
-        st.write("##### Label drift")
-        st.dataframe(style_label_drift_dataframe(label_drift_df), use_container_width=True)
+        st.info("Run ML Analytics to generate drift detection analytics.")
+        return
 
-    st.markdown("---")
+    drift_values, feature_drift_df, label_drift_df = build_drift_summary(drift_report)
+    drift_cols = st.columns(3)
+    drift_cols[0].metric("Overall drift score", f"{drift_values['Overall drift score']:.3f}")
+    drift_cols[1].metric("Largest shifted feature", drift_values["Largest shifted feature"])
+    drift_cols[2].metric("Average drift", f"{drift_values['Average drift']:.3f}")
+    st.write("##### Feature drift")
+    st.dataframe(style_feature_drift_dataframe(feature_drift_df), use_container_width=True)
+    st.write("##### Label drift")
+    st.dataframe(style_label_drift_dataframe(label_drift_df), use_container_width=True)
+
+
+def _render_anomaly_detection(st: Any, anomaly_report: Optional[AnomalyReport]) -> None:
     st.subheader("Anomaly Detection")
     if anomaly_report is None:
-        st.info("Upload an anomaly report JSON file to show anomaly and cluster summaries.")
-    else:
-        anomaly_summary, cluster_df = build_anomaly_summary(anomaly_report)
-        anomaly_cols = st.columns(4)
-        anomaly_cols[0].metric("Anomalies", anomaly_summary["Anomalies"])
-        anomaly_cols[1].metric("Noise points", anomaly_summary["Noise points"])
-        anomaly_cols[2].metric("Unknown failures", anomaly_summary["Unknown failure candidates"])
-        anomaly_cols[3].metric("Cluster groups", anomaly_summary["Cluster groups"])
-        if not cluster_df.empty:
-            st.write("##### DBSCAN cluster statistics")
-            st.dataframe(cluster_df, use_container_width=True)
-        records = anomaly_report.get("records")
-        if isinstance(records, list) and records:
-            st.write("##### Anomaly records")
-            st.dataframe(
-                pd.DataFrame(records)[
-                    ["session_id", "anomaly_score", "is_anomaly", "cluster_id", "is_noise", "is_unknown_failure"]
-                ],
-                use_container_width=True,
-            )
+        st.info("Run ML Analytics to generate anomaly detection analytics.")
+        return
 
-    st.markdown("---")
+    anomaly_summary, cluster_df = build_anomaly_summary(anomaly_report)
+    anomaly_cols = st.columns(4)
+    anomaly_cols[0].metric("Anomalies", anomaly_summary["Anomalies"])
+    anomaly_cols[1].metric("Noise points", anomaly_summary["Noise points"])
+    anomaly_cols[2].metric("Unknown failures", anomaly_summary["Unknown failure candidates"])
+    anomaly_cols[3].metric("Cluster groups", anomaly_summary["Cluster groups"])
+    if not cluster_df.empty:
+        st.write("##### DBSCAN cluster statistics")
+        st.dataframe(cluster_df, use_container_width=True)
+    records = anomaly_report.get("records")
+    if isinstance(records, list) and records:
+        st.write("##### Anomaly records")
+        st.dataframe(
+            pd.DataFrame(records)[
+                ["session_id", "anomaly_score", "is_anomaly", "cluster_id", "is_noise", "is_unknown_failure"]
+            ],
+            use_container_width=True,
+        )
+
+
+def _render_export_buttons(
+    st: Any,
+    evaluation_report: Optional[EvaluationReport],
+    importance_reports: List[FeatureImportanceReport],
+    drift_report: Optional[DriftReport],
+    anomaly_report: Optional[AnomalyReport],
+) -> None:
     st.subheader("Export ML Reports")
-    eval_payload = create_download_payload(evaluation_reports[0] if evaluation_reports else None)
-    importance_payload = create_download_payload(valid_importance_reports[0] if valid_importance_reports else None)
+    eval_payload = create_download_payload(evaluation_report)
+    importance_payload = create_download_payload(importance_reports[0] if importance_reports else None)
     drift_payload = create_download_payload(drift_report)
     anomaly_payload = create_download_payload(anomaly_report)
     export_cols = st.columns(4)
@@ -555,4 +644,99 @@ def render_ml_analytics() -> None:
         file_name="anomaly_report.json",
         mime="application/json",
         disabled=anomaly_payload is None,
+    )
+
+
+def render_ml_analytics() -> None:
+    """Render the ML analytics tab for the Streamlit dashboard."""
+    import streamlit as st
+
+    st.header("📊 ML Analytics")
+    st.write(
+        "Upload a dataset file and run the ML analytics workflow. The dashboard will "
+        "execute evaluation, feature importance, drift detection, and anomaly analysis automatically."
+    )
+
+    if "ml_dataset_key" not in st.session_state:
+        st.session_state["ml_dataset_key"] = None
+    if "ml_analytics_results" not in st.session_state:
+        st.session_state["ml_analytics_results"] = None
+
+    with st.expander("Upload dataset and run analytics", expanded=True):
+        dataset_col, action_col = st.columns([3, 1])
+        dataset_file = dataset_col.file_uploader(
+            "Dataset file",
+            type=["jsonl", "ndjson", "csv"],
+            key="ml_dataset_upload",
+            help="Upload a synthetic interview sessions dataset for ML analytics.",
+        )
+        run_analytics = action_col.button("Run ML Analytics", type="primary")
+
+    dataset_statistics: Optional[DatasetStatistics] = None
+    dataset: Optional[MLDataset] = None
+    dataset_error: Optional[str] = None
+    dataset_key = DEFAULT_DATASET_KEY
+    dataset_bytes: Optional[bytes] = None
+    dataset_suffix = ".jsonl"
+
+    if dataset_file is not None:
+        dataset_bytes = dataset_file.getvalue()
+        dataset_suffix = Path(dataset_file.name).suffix or ".jsonl"
+        dataset_key = dataset_cache_key(dataset_file.name, dataset_bytes)
+
+    try:
+        if dataset_bytes is not None:
+            dataset_statistics, dataset = load_dataset_from_bytes(dataset_bytes, dataset_suffix)
+        else:
+            dataset_statistics, dataset = load_dataset_statistics(DEFAULT_DATASET_PATH)
+    except Exception as error:
+        dataset_error = str(error)
+
+    if run_analytics and dataset is not None and dataset_error is None:
+        if st.session_state["ml_dataset_key"] != dataset_key:
+            st.session_state["ml_analytics_results"] = None
+        try:
+            status_placeholder = st.empty()
+            progress_bar = st.progress(0)
+
+            def status_update(percent: int, message: str) -> None:
+                progress_bar.progress(percent)
+                status_placeholder.info(message)
+
+            _, baseline_dataset = load_dataset_statistics(DEFAULT_DATASET_PATH)
+            ml_results = run_ml_analytics(
+                dataset,
+                baseline_dataset,
+                random_state=42,
+                progress_callback=status_update,
+            )
+            st.session_state["ml_dataset_key"] = dataset_key
+            st.session_state["ml_dataset_statistics_cache"] = dataset_statistics
+            st.session_state["ml_dataset_cache"] = dataset
+            st.session_state["ml_analytics_results"] = ml_results
+        except Exception as error:
+            st.error(f"ML analytics failed: {error}")
+            st.session_state["ml_analytics_results"] = None
+
+    if st.session_state["ml_dataset_key"] == dataset_key and st.session_state["ml_analytics_results"] is not None:
+        ml_results = st.session_state["ml_analytics_results"]
+    else:
+        ml_results = None
+
+    _render_dataset_overview(st, dataset_statistics, dataset, dataset_error)
+    st.markdown("---")
+    _render_model_evaluation(st, ml_results["evaluation_report"] if ml_results else None)
+    st.markdown("---")
+    _render_feature_importance(st, ml_results["feature_importance_reports"] if ml_results else [])
+    st.markdown("---")
+    _render_drift_detection(st, ml_results["drift_report"] if ml_results else None)
+    st.markdown("---")
+    _render_anomaly_detection(st, ml_results["anomaly_report"] if ml_results else None)
+    st.markdown("---")
+    _render_export_buttons(
+        st,
+        ml_results["evaluation_report"] if ml_results else None,
+        ml_results["feature_importance_reports"] if ml_results else [],
+        ml_results["drift_report"] if ml_results else None,
+        ml_results["anomaly_report"] if ml_results else None,
     )

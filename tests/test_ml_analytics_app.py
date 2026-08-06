@@ -5,10 +5,14 @@ import numpy as np
 
 from app.ml_analytics import (
     build_evaluation_dataframe,
+    create_download_payload,
+    dataset_cache_key,
     feature_importance_dataframe,
     get_confusion_matrix,
     load_dataset_statistics,
     load_json_report,
+    run_ml_analytics,
+    DEFAULT_DATASET_PATH,
 )
 
 
@@ -83,3 +87,31 @@ def test_load_dataset_statistics_default_sample() -> None:
     assert stats.feature_count > 0
     assert len(dataset.session_ids) == stats.row_count
     assert len(dataset.feature_names) == stats.feature_count
+
+
+def test_dataset_cache_key_changes_for_different_content() -> None:
+    first_key = dataset_cache_key("sessions.jsonl", b"first content")
+    second_key = dataset_cache_key("sessions.jsonl", b"second content")
+    assert first_key != second_key
+    assert first_key == dataset_cache_key("sessions.jsonl", b"first content")
+
+
+def test_create_download_payload_serializes_report() -> None:
+    payload = create_download_payload({"model": "Logistic Regression", "accuracy": 0.92})
+    assert isinstance(payload, str)
+    assert '"model": "Logistic Regression"' in payload
+
+
+def test_run_ml_analytics_generates_reports_for_sample_dataset() -> None:
+    _, dataset = load_dataset_statistics(DEFAULT_DATASET_PATH)
+    _, baseline_dataset = load_dataset_statistics(DEFAULT_DATASET_PATH)
+    results = run_ml_analytics(dataset, baseline_dataset, random_state=42)
+
+    assert "evaluation_report" in results
+    assert "feature_importance_reports" in results
+    assert "drift_report" in results
+    assert "anomaly_report" in results
+    assert isinstance(results["evaluation_report"], dict)
+    assert isinstance(results["feature_importance_reports"], list)
+    assert len(results["feature_importance_reports"]) >= 1
+    assert results["evaluation_report"].get("evaluations")

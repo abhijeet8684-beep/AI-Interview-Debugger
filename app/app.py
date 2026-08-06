@@ -68,7 +68,7 @@ def _render_project_sidebar() -> None:
     """Render static project information and the backend pipeline overview."""
     st.sidebar.title("AI Interview Debugger")
     st.sidebar.caption("Explainable AI interview observability")
-    st.sidebar.success("Backend status: 47 tests passing")
+    st.sidebar.success("Backend status: 85 tests passing")
     st.sidebar.divider()
     st.sidebar.subheader("Versions")
     st.sidebar.write("Dataset: `from uploaded session`")
